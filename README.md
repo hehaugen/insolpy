@@ -1,0 +1,1 @@
+Python Implementation of the R package "insol" with added functions. Calculates vector geometry of sun position and raster functions like hillshading/topographic shading used to adjust solar radiation.
