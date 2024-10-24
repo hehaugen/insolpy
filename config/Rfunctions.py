@@ -20,13 +20,13 @@ with open(rdir / 'sunvector.R', 'r') as f:
     string = f.read()
 R_sunvector = STAP(string, 'sunvector')
 
-with open(rdir / 'cgrad.R', 'r') as f:
-    string = f.read()
-R_cgrad = STAP(string, 'cgrad')
+# with open(rdir / 'cgrad.R', 'r') as f:
+#     string = f.read()
+# R_cgrad = STAP(string, 'cgrad')
 
-with open(rdir / 'hillshading.R', 'r') as f:
-    string = f.read()
-R_hillshading = STAP(string, 'hillshading')
+# with open(rdir / 'hillshading.R', 'r') as f:
+#     string = f.read()
+# R_hillshading = STAP(string, 'hillshading')
 
 with open(rdir / 'normalvector.R', 'r') as f:
     string = f.read()
