@@ -17,15 +17,15 @@ def shade_helper(nhdid):
     geom = Gproj[Gproj['Permanent_'] == nhdid]
     tmzn = -7
 
-    result = dailyshade_geometry(dem, geom, tmzn, '2000-01-01', '2000-12-31')
+    result = dailyshade_geometry(dem, geom, tmzn, '2000-06-01', '2000-06-30')
 
     result.to_csv('{0}.csv'.format(nhdid))
     print("Finished geometry.")
 
 
 if __name__ == '__main__':
-    #shade_helper(nhdIDs[0])
+    shade_helper(nhdIDs[0])
 
-    with Pool(20) as pool:
-        pool.map(shade_helper, nhdIDs)
-    print("Finished all Processes.")
+    # with Pool(20) as pool:
+    #     pool.map(shade_helper, nhdIDs)
+    # print("Finished all Processes.")

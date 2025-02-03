@@ -76,6 +76,7 @@ def doshade(dem, sv, res):
     """
     # TODO - I think this function could have improved performance, if everything was done using vector operations
     #   rather than looping through, tried to figure out a way but haven't solved it yet.
+    #   Could also explore Cython as a C-wrapper to speed up for loops...
     sunvector = sv  # from sunvector R function
     dl = res
     sunvector = Vector(np.array(sunvector).flatten()) # could probably do this under the insolpy.sunvector() func
@@ -243,9 +244,9 @@ def doshade_geometry(raster, geom, sun_vector, poly_output='scalar'):
         zorigins = datarray[origins[0], origins[1]]
         xos = origins[1][None, :]
         yos = origins[0][None, :]
-        xros = np.tile(xr, (origins[1].shape[0], 1)).T
+        xros = np.tile(xr, (origins[1].shape[0], 1)).T  # depends on sv
         xis = (xos + xros)
-        yros = np.tile(yr, (origins[1].shape[0], 1)).T
+        yros = np.tile(yr, (origins[1].shape[0], 1)).T # depends on sv
         yjs = (yos + yros)
         xboo = ((xis > 0) & (xis < ncols - 1)).all(axis=1)
         xmsk_sz = xboo[xboo].shape[0]
@@ -405,42 +406,113 @@ def dailyshade_geometry(raster, geom, timezone, start, end):
         wgs_geom = geom.to_crs(4326)
         lat = wgs_geom.geometry.y.iloc[0]
         lon = wgs_geom.geometry.x.iloc[0]
+
+        shd_vals = []
+        for day in dates:
+            dlday = day + timedelta(hours=12)
+            midjd = JD(dlday)
+            day_len = daylength(lat, lon, midjd, tmzn)
+            hour_vals = []
+            for h in np.linspace(day_len[0], day_len[1], int(day_len[2]), endpoint=True):
+                hhours = int(h)
+                hminutes = h * 60 % 60
+
+                dayhr = JD(day + timedelta(hours=hhours, minutes=hminutes))
+                sv = sunvector(dayhr, lat, lon, tmzn)
+
+                hsh = hillshade_geometry(raster, geom, sv, poly_output='scalar')
+                shd = doshade_geometry(raster, geom, sv, poly_output='scalar')
+                HS = hsh * shd
+
+                hour_vals.append(HS)
+
+            day_array = np.array(hour_vals)
+
+            day_shd = day_array.mean()
+            shd_vals.append(day_shd)
+
+        shd_srs = pd.Series(shd_vals, index=pd.DatetimeIndex(dates))
+        shd_srs.name = 'shd_factor'
+
     elif g.geom_type == 'Polygon':
+        datarray = raster.sel(band=1).data
+        data_res = raster.rio.resolution()[0]
+
         cent = geom.centroid
         cent_wgs = cent.to_crs(4326)
         lat = cent_wgs.geometry.y.iloc[0]
         lon = cent_wgs.geometry.x.iloc[0]
+
+        clipped = raster.rio.clip(geom.geometry.values, geom.crs, drop=False)
+        origins = np.where(~np.isnan(clipped.sel(band=1).data))
+        zorigins = datarray[origins[0], origins[1]]
+        xos = origins[1][None, :]
+        yos = origins[0][None, :]
+
+        shd_vals = []
+        for day in dates:
+            dlday = day + timedelta(hours=12)
+            midjd = JD(dlday)
+            day_len = daylength(lat, lon, midjd, tmzn)
+            hour_vals = []
+            for h in np.linspace(day_len[0], day_len[1], int(day_len[2]), endpoint=True):
+                hhours = int(h)
+                hminutes = h * 60 % 60
+
+                dayhr = JD(day + timedelta(hours=hhours, minutes=hminutes))
+                sv = sunvector(dayhr, lat, lon, tmzn)
+
+                xv = sv[0]
+                yv = sv[1]
+                zv = sv[2]
+                nrows, ncols = datarray.shape
+                ray_ln = np.max(datarray.shape)
+                d = np.sqrt(np.sqrt(1) / (xv ** 2 + yv ** 2))
+                dr = np.arange(0, ray_ln, d)
+                xr = (dr * xv).astype(int)
+                yr = (dr * yv).astype(int)
+                zr = dr * data_res * zv
+
+                xros = np.tile(xr, (origins[1].shape[0], 1)).T  # depends on sv
+                xis = (xos + xros)
+                yros = np.tile(yr, (origins[1].shape[0], 1)).T  # depends on sv
+                yjs = (yos + yros)
+                xboo = ((xis > 0) & (xis < ncols - 1)).all(axis=1)
+                xmsk_sz = xboo[xboo].shape[0]
+                xboo = np.tile(xboo, (xis.shape[1], 1)).T
+                yboo = ((yjs > 0) & (yjs < nrows - 1)).all(axis=1)
+                ymsk_sz = yboo[yboo].shape[0]
+                yboo = np.tile(yboo, (yjs.shape[1], 1)).T
+                lnmsk = np.logical_and(xboo, yboo)
+                msk_rows = np.min([xmsk_sz, ymsk_sz])
+                msk_cols = lnmsk.shape[1]
+                xi_clp = xis[lnmsk]
+                yj_clp = yjs[lnmsk]
+                z_ext = datarray[yj_clp, xi_clp]
+                z_ext = z_ext.reshape((msk_rows, msk_cols))
+                zproj = zorigins[None, :] + np.tile(zr, (zorigins.shape[0], 1)).T
+                zdiff = zproj[lnmsk].reshape((msk_rows, msk_cols)) - z_ext
+                shdf = np.where((zdiff < 0).any(axis=0), 0.0, 1.0)
+                shd = np.nanmean(shdf)
+
+                hsh = hillshade_geometry(raster, geom, sv, poly_output='scalar')
+                HS = hsh * shd
+
+                hour_vals.append(HS)
+
+            day_array = np.array(hour_vals)
+
+            day_shd = day_array.mean()
+            shd_vals.append(day_shd)
+
+        shd_srs = pd.Series(shd_vals, index=pd.DatetimeIndex(dates))
+        shd_srs.name = 'shd_factor'
+
     else:
         print("Geometry type input not supported.")
         lat = None
         lon = None
-
-    shd_vals = []
-    for day in dates:
-        dlday = day + timedelta(hours=12)
-        midjd = JD(dlday)
-        day_len = daylength(lat, lon, midjd, tmzn)
-        hour_vals = []
-        for h in np.linspace(day_len[0], day_len[1], int(day_len[2]), endpoint=True):
-            hhours = int(h)
-            hminutes = h * 60 % 60
-
-            dayhr = JD(day + timedelta(hours=hhours, minutes=hminutes))
-            sv = sunvector(dayhr, lat, lon, tmzn)
-
-            hsh = hillshade_geometry(raster, geom, sv, poly_output='scalar')
-            shd = doshade_geometry(raster, geom, sv, poly_output='scalar')
-            HS = hsh * shd
-
-            hour_vals.append(HS)
-
-        day_array = np.array(hour_vals)
-
-        day_shd = day_array.mean()
-        shd_vals.append(day_shd)
-
-    shd_srs = pd.Series(shd_vals, index=pd.DatetimeIndex(dates))
-    shd_srs.name = 'shd_factor'
+        shd_srs = None
 
     return shd_srs
 
