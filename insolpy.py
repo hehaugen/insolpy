@@ -1,5 +1,6 @@
-import geopandas as gpd
+#import geopandas as gpd
 import rioxarray
+from numba import jit
 import pandas as pd
 import rasterio as rio
 import numpy as np
@@ -74,9 +75,7 @@ def doshade(dem, sv, res):
     :param res: float - DEM resolution
     :return: np.array - Essentially a boolean array of no shade (1) and shade (0)
     """
-    # TODO - I think this function could have improved performance, if everything was done using vector operations
-    #   rather than looping through, tried to figure out a way but haven't solved it yet.
-    #   Could also explore Cython as a C-wrapper to speed up for loops...
+
     sunvector = sv  # from sunvector R function
     dl = res
     sunvector = Vector(np.array(sunvector).flatten()) # could probably do this under the insolpy.sunvector() func
@@ -124,7 +123,9 @@ def doshade(dem, sv, res):
             # y_int[jdy, idx] = vectororigin[1]
             # zint[jdy, idx] = vectororigin[2]
             # zproj[jdy, idx] = zprojection
-            if zprojection < zcompare:
+            if np.isnan(zprojection):
+                sombra[jdy, idx] = np.nan
+            elif zprojection < zcompare:
                 sombra[jdy, idx] = 0
             else:
                 zcompare = zprojection
@@ -152,7 +153,9 @@ def doshade(dem, sv, res):
             # y_int[jdy, idx] = vectororigin[1]
             # zint[jdy, idx] = vectororigin[2]
             # zproj[jdy, idx] = zprojection
-            if zprojection < zcompare:
+            if np.isnan(zprojection):
+                sombra[jdy, idx] = np.nan
+            elif zprojection < zcompare:
                 sombra[jdy, idx] = 0
             else:
                 zcompare = zprojection
@@ -184,6 +187,95 @@ def hillshading(cgrad, sv):
     hsh = cgrad[:, :, 0] * sv[0] + cgrad[:, :, 1] * sv[1] + cgrad[:, :, 2] * sv[2]
     hsh = (hsh + np.abs(hsh)) / 2
     return hsh
+
+# to be safe, make sure all inputs are float64
+@jit(nopython=True)
+def fast_doshade(dem, sp, res):
+
+    rads = np.radians(sp)
+    nvx = np.sin(rads[0]) * np.sin(rads[1])
+    nvy = -np.cos(rads[0]) * np.sin(rads[1])
+    nvz = np.cos(rads[1])
+    sunvector = np.array([nvx, nvy, nvz])
+    dl = res
+    sombra = np.ones(dem.shape)
+    vectororigin = np.zeros(3)
+    nrows = dem.shape[0]
+    ncols = dem.shape[1]
+
+    inversesunvector = -sunvector / np.max(np.abs(np.array([sunvector[0], sunvector[1]])))
+
+    inv_az = (sp[0] + 180) % 360
+    inv_zen = 90 - sp[1]
+    inv_sp = np.array([inv_az, inv_zen])
+    radsinv = np.radians(inv_sp)
+    invvx = np.sin(radsinv[0]) * np.sin(radsinv[1])
+    invvy = -np.cos(radsinv[0]) * np.sin(radsinv[1])
+    invvz = np.cos(radsinv[1])
+    normalsunvector = np.array([invvx, invvy, invvz])
+
+    casx = np.trunc(1e6 * sunvector[0])
+    casy = np.trunc(1e6 * sunvector[1])
+    if casx < 0:
+        f_i = 0
+    else:
+        f_i = ncols - 1
+
+    if casy < 0:
+        f_j = 0
+    else:
+        f_j = nrows - 1
+
+    j = f_j
+    for i in range(ncols):
+        n = 0
+        zcompare = -1e13
+        while n >= 0:
+            dx = inversesunvector[0] * n
+            dy = inversesunvector[1] * n
+            idx = int(i + dx)
+            jdy = int(j + dy)
+            if ((idx < 0) | (idx > ncols - 1)) | ((jdy < 0) | (jdy > nrows - 1)):
+                break
+            vectororigin[0] = dx * dl
+            vectororigin[1] = dy * dl
+            vectororigin[2] = dem[jdy, idx]
+            zprojection = np.dot(vectororigin, normalsunvector)
+            if np.isnan(zprojection):
+                sombra[jdy, idx] = np.nan
+            elif zprojection < zcompare:
+                sombra[jdy, idx] = 0
+            else:
+                zcompare = zprojection
+
+            n = n + 1
+
+    i = f_i
+    for j in range(nrows):
+        n = 0
+        zcompare = -1e13
+        while n >= 0:
+            dx = inversesunvector[0] * n
+            dy = inversesunvector[1] * n
+            idx = int(i + dx)
+            jdy = int(j + dy)
+            if ((idx < 0) | (idx > ncols - 1)) | ((jdy < 0) | (jdy > nrows - 1)):
+                break
+            vectororigin[0] = dx * dl
+            vectororigin[1] = dy * dl
+            vectororigin[2] = dem[jdy, idx]
+            zprojection = np.dot(vectororigin, normalsunvector)
+            if np.isnan(zprojection):
+                sombra[jdy, idx] = np.nan
+            elif zprojection < zcompare:
+                sombra[jdy, idx] = 0
+            else:
+                zcompare = zprojection
+
+            n = n + 1
+
+    return sombra
+
 
 # TODO - need to include code to check that the geometry is within the provided raster bounds
 def doshade_geometry(raster, geom, sun_vector, poly_output='scalar'):
