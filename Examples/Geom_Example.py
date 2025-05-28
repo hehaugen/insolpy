@@ -1,11 +1,9 @@
 import rioxarray
 import geopandas as gpd
-import numpy as np
 from pathlib import Path
-from multiprocessing import Pool
 import time
 
-from insolpy import dailyshade_geometry
+from src import dailyshade_geometry
 
 rasterdir = Path(r'C:\Users\CNB968\OneDrive - MT\GitHub\insolpy\Examples\Tongue_R_30m.tif')
 geomdir = Path(r'D:\ArcGIS_Projects\Yellowstone\Tongue River\Vector\HWWY_reservoirs.shp')

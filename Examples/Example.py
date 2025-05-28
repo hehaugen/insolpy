@@ -4,7 +4,7 @@ import xarray as xr
 from pathlib import Path
 from multiprocessing import Pool
 
-from insolpy import dailyshade
+from src import dailyshade
 
 
 # first get some DEM data for a HUC12 cathment

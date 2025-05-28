@@ -32,7 +32,7 @@ print(f"insolpy.cgrad(): {min(timeit.Timer(lambda: insolpy.cgrad(huc12arr, dlx=h
 print(f"insolpy.hillshading(): {min(timeit.Timer(lambda: insolpy.hillshading(cg, sunvec)).repeat(5, 1))} sec; minimum of 5 runs, 1 loop each.")
 print(f"insolpy.doshade(): {min(timeit.Timer(lambda: insolpy.doshade(huc12arr, sunvec, huc12res)).repeat(5, 1))} sec; minimum of 5 runs, 1 loop each.")
 print("This is to test the accelerated doshade() function - fast_doshade() which should have better performance because of numba runtime compiling.")
-print(f"fast_doshade(): {min(timeit.Timer(lambda: insolpy.fast_doshade(huc12arr.astype(np.float64), np.array([200,58]), huc12res)).repeat(5, 1))} sec; minimum of 5 runs, 1 loop each.")
+print(f"fast_doshade(): {min(timeit.Timer(lambda: insolpy.fast_doshade(huc12arr.astype(np.float64), np.array([200, 58]), huc12res)).repeat(5, 1))} sec; minimum of 5 runs, 1 loop each.")
 
 print("doshade is clearly the performance issue because of nested looping. The next tests perform shade mapping for 500 sun positions on a single HUC12.")
 randaz = np.random.uniform(90, 270, 500)
@@ -49,7 +49,7 @@ def many_sunpos_slow(azarr, zenarr):
 def many_sunpos_fast(azarr, zenarr):
     arrays = []
     for i in range(len(randaz)):
-        out = insolpy.fast_doshade(huc12arr.astype(np.float64), np.array([200,58]), huc12res)
+        out = insolpy.fast_doshade(huc12arr.astype(np.float64), np.array([200, 58]), huc12res)
         arrays.append(out)
 
     return arrays
@@ -57,7 +57,7 @@ def many_sunpos_fast(azarr, zenarr):
 def many_sunpos_fasthuc8(azarr, zenarr):
     arrays = []
     for i in range(len(randaz)):
-        out = insolpy.fast_doshade(huc8arr.astype(np.float64), np.array([200,58]), huc8res)
+        out = insolpy.fast_doshade(huc8arr.astype(np.float64), np.array([200, 58]), huc8res)
         arrays.append(out)
 
     return arrays
@@ -66,6 +66,6 @@ print(f"doshade() with 500 sun positions: {min(timeit.Timer(lambda: many_sunpos_
 print(f"fast_doshade() with 500 sun positions: {min(timeit.Timer(lambda: many_sunpos_fast(randaz, randzen)).repeat(5, 1))} sec; minimum of 5 runs, 1 loop each.")
 
 print("We know that the fast version of doshade() has a significant performance boost. Here is a further test of it on an ~HUC8 size basin.")
-print(f"fast_doshade(): {min(timeit.Timer(lambda: insolpy.fast_doshade(huc8arr.astype(np.float64), np.array([200,58]), huc8res)).repeat(5, 1))} sec; minimum of 5 runs, 1 loop each.")
+print(f"fast_doshade(): {min(timeit.Timer(lambda: insolpy.fast_doshade(huc8arr.astype(np.float64), np.array([200, 58]), huc8res)).repeat(5, 1))} sec; minimum of 5 runs, 1 loop each.")
 print("And, a test of the HUC8 size for 500 sun positions.")
 print(f"fast_doshade() with 500 sun positions: {min(timeit.Timer(lambda: many_sunpos_fasthuc8(randaz, randzen)).repeat(5, 1))} sec; minimum of 5 runs, 1 loop each.")
