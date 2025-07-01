@@ -4,12 +4,17 @@ from pathlib import Path
 from typing import Union, Optional
 
 import geopandas as gpd
+from shapely.geometry import Polygon
+import matplotlib.pyplot as plt
 from numba import jit
 import pandas as pd
 import rasterio as rio
+from rasterio.warp import transform_bounds, transform
+from rasterio.crs import CRS
 import numpy as np
 import insolation.insolf as insol
 from affine import Affine
+import xarray as xr
 from shapely.geometry import Point, Polygon
 
 
@@ -45,12 +50,19 @@ class Dem:
                  transform: Affine,
                  resolution: tuple,
                  crs: rio.crs.CRS,
-                 bounds: rio.coords.BoundingBox):
-        self.data = array
+                 bounds: tuple | rio.coords.BoundingBox,
+                 nodata: int | float | None = None,
+                 filepath: str | Path | None = None
+                 ):
+        if nodata is None:
+            self.data = array
+        else:
+            self.data = np.where(array == nodata, np.nan, array)
         self.transform = transform
         self.resolution = resolution
         self.crs = crs
         self.bounds = bounds
+        self.filepath = filepath
 
     @staticmethod
     def load_raster(fl: str | Path):
@@ -60,9 +72,362 @@ class Dem:
             resolution = src.res
             bnds = src.bounds
             crs = src.crs
+            nodat = src.nodata
 
-        return Dem(data, transform, resolution, crs, bnds)
+        return Dem(data, transform, resolution, crs, bnds, nodat, filepath=fl)
 
+
+class SunPosCorrections:
+
+    def __init__(self,
+                 raster: str | Path | Dem,
+                 azimuth_res: float,
+                 zenith_res: float,
+                 corrections_dset: xr.Dataset | None = None,
+                 verbose: bool = False):
+
+        if isinstance(raster, (str, Path)):
+            r = Dem.load_raster(raster)
+            self.datarray = r.data
+            self.data_res = r.resolution[0]
+            self.transform = r.transform
+            self.crs = r.crs
+            self.bounds = list(r.bounds)
+            if self.crs != CRS.from_epsg(4326):
+                self.latlonbounds = transform_bounds(self.crs, CRS.from_epsg(4326), r.bounds[0], r.bounds[1], r.bounds[2], r.bounds[3])
+            else:
+                self.latlonbounds = r.bounds
+            self.elev_ds_path = raster
+
+        else:
+            self.datarray = raster.data
+            self.data_res = raster.resolution[0]
+            self.transform = raster.transform
+            self.crs = raster.crs
+            self.bounds = list(raster.bounds)
+            if raster.crs != CRS.from_epsg(4326):
+                self.latlonbounds = transform_bounds(self.crs, CRS.from_epsg(4326), raster.bounds[0], raster.bounds[1], raster.bounds[2],
+                                               raster.bounds[3])
+            else:
+                self.latlonbounds = raster.bounds
+            self.elev_ds_path = raster.filepath
+
+        if self.elev_ds_path is None:
+            self.elev_ds_path = []
+        elif isinstance(self.elev_ds_path, Path):
+            self.elev_ds_path = self.elev_ds_path.as_posix()
+        else:
+            pass
+
+        self.azimuth_resolution = azimuth_res
+        self.zenith_resolution = zenith_res
+        self.verbose = verbose
+        self._ref_sunpos = self._get_all_sunpos()
+        self.resampled_azimuths = None
+        self.resampled_zeniths = None
+        self._zarr_path = None
+        self.sunpos_grid = self._make_sunpos_grid()
+        if corrections_dset is None:
+            self._terr_cor = None
+        else:
+            self.corrections = corrections_dset
+
+    @property
+    def corrections(self):
+        if self._terr_cor is None:
+            print("No corrections have been computed yet.")
+        else:
+            return self._terr_cor
+
+    @corrections.setter
+    def corrections(self, dataset: xr.Dataset):
+        self._terr_cor = dataset
+
+    # From Evan's code - get_correction_reference() function...needs to have an option to output to zarr file or for
+    #   now, hold in memory (for smaller applications). Also, xarray.Dataset, try having separate dimensions with
+    #   indices for azimuth and zenith so you can use xarray's "nearest" search capabilities.
+    def calculate_terrain_corrections(self, output: str | None = None, outpth: str | Path | None = None):
+        """
+        Function to calculate the terrain corrections for each sun-position in the resampled sun-position grid using
+        the input DEM raster. These calculations can be stored in memory or archived in a zarr database for larger
+        raster datasets, using the output argument.
+
+        Args:
+            output: str | None
+                Currently, the only valid argument is 'zarr' which will append each sun-positions terrain correction
+                factors to a zarr file. The default is None, which will store all calculations in-memory. For large
+                raster datasets this will likely cause a memory issue.
+            outpth: str | Path | None
+                Only applicable if output is set to 'zarr', this is the file path location of the output zarr file.
+                Must contain the file name with or without .zarr extension.
+
+        Returns: xr.Dataset | None
+            Depending on the output option, will return an xarray Dataset or None, as the correction surface for
+            each sun-position will be appended to an archive when set to None.
+
+        """
+        if output is None:
+            cf_array = np.empty((self.datarray.shape[0], self.datarray.shape[1], self.resampled_azimuths.size,
+                                 self.resampled_zeniths.size))
+            for i, av in enumerate(self.resampled_azimuths):
+                for j, zv in enumerate(self.resampled_zeniths):
+                    sv = insol.normalvector(zv, av)
+                    shd = fast_doshade(self.datarray, np.array([av, zv]), self.data_res)
+                    hs = insol.hillshading(dem=self.datarray, dlxy=self.data_res, sunv=sv)
+                    cf = shd * hs
+                    cf_array[:, :, i, j] = cf
+
+            corr_xds = xr.Dataset(
+                {
+                    "correction_factor": (['row', 'column', 'azimuth', 'zenith'], cf_array,
+                                          {'description': "Solar Radiation multiplicative correction factor"
+                                                          " that accounts for terrain slope and shading.",
+                                           'units': "None"})
+                },
+                coords={
+                    "row": np.arange(self.datarray.shape[0]),
+                    "column": np.arange(self.datarray.shape[1]),
+                    "azimuth": self.resampled_azimuths,
+                    "zenith": self.resampled_zeniths
+                },
+                attrs={
+                    'crs': self.crs.to_wkt(),
+                    'transform': list(self.transform)[0:6],
+                    'bounds': self.bounds,
+                    'resolution': [list(self.transform)[0], list(self.transform)[4]],
+                    'azimuth_res': self.azimuth_resolution,
+                    'zenith_res': self.zenith_resolution,
+                    'elev_path': self.elev_ds_path
+                }
+            )
+
+            self.corrections = corr_xds
+            return corr_xds
+        elif output == 'zarr':
+            if outpth is None:
+                raise ValueError("A filepath must be provided when output mode is set to 'zarr'.")
+            if isinstance(outpth, str):
+                outpth = Path(outpth)
+            self._zarr_path = outpth
+            template_ds = xr.Dataset(
+                {
+                    "correction_factor": (['row', 'column', 'azimuth', 'zenith'], np.empty((self.datarray.shape[0], self.datarray.shape[1], self.resampled_azimuths.size,
+                                 self.resampled_zeniths.size)),
+                                          {'description': "Solar Radiation multiplicative correction factor"
+                                                          " that accounts for terrain slope and shading.",
+                                           'units': "None"})
+                },
+                coords={
+                    "row": np.arange(self.datarray.shape[0]),
+                    "column": np.arange(self.datarray.shape[1]),
+                    "azimuth": self.resampled_azimuths,
+                    "zenith": self.resampled_zeniths
+                },
+                attrs={
+                    'crs': self.crs.to_wkt(),
+                    'transform': list(self.transform)[0:6],
+                    'bounds': self.bounds,
+                    'resolution': [list(self.transform)[0], list(self.transform)[4]],
+                    'azimuth_res': self.azimuth_resolution,
+                    'zenith_res': self.zenith_resolution,
+                    'elev_path': self.elev_ds_path
+                }
+            )
+            #template_ds = template_ds.chunk({'row': 1000, 'column': 1000})
+            template_ds.to_zarr(self._zarr_path.as_posix(), mode='w', compute=False)
+            for i, av in enumerate(self.resampled_azimuths):
+                for j, zv in enumerate(self.resampled_zeniths):
+                    sv = insol.normalvector(zv, av)
+                    shd = fast_doshade(self.datarray, np.array([av, zv]), self.data_res)
+                    hs = insol.hillshading(dem=self.datarray, dlxy=self.data_res, sunv=sv)
+                    cf = shd * hs
+                    cf_ds = xr.Dataset(
+                        {
+                            "correction_factor": (['row', 'column', 'azimuth', 'zenith'], cf[:,:,None,None])
+                        }
+                    )
+                    #cf_ds = cf_ds.chunk({'row': 1000, 'column': 1000})
+                    cf_ds.to_zarr(self._zarr_path.as_posix(),
+                                region={'azimuth': slice(i, i + 1), 'zenith': slice(j, j + 1)})
+
+            self.corrections = xr.open_zarr(self._zarr_path)
+        else:
+            raise NotImplementedError("Output types other than 'zarr' are not supported.")
+
+    def get_terrain_correction(self, azimuth: float, zenith: float) -> xr.DataArray:
+        subset = self.corrections.sel(azimuth=azimuth, zenith=zenith, method='nearest').correction_factor
+
+        return subset
+
+    def get_nearest_sunpos(self,
+                           azimuth: float | list[float] | np.ndarray,
+                           zenith: float | list[float] | np.ndarray,
+                           return_ids: bool = False
+                           ) -> pd.DataFrame:
+        """Returns a dataframe of the interpolated, or nearest, sun-position.
+
+        Args:
+            azimuth:
+            zenith:
+
+        Returns:
+
+        """
+        aidx = np.searchsorted(self.resampled_azimuths, azimuth)
+        aidx = np.where(aidx == self.resampled_azimuths.size, self.resampled_azimuths.size - 1, aidx)
+        zidx = np.searchsorted(self.resampled_zeniths, zenith)
+        zidx = np.where(zidx == self.resampled_zeniths.size, self.resampled_zeniths.size - 1, zidx)
+        df = pd.DataFrame({'azimuth_nearest': self.resampled_azimuths[aidx],
+                           'zenith_nearest': self.resampled_zeniths[zidx]})
+        if return_ids:
+            df['azimuth_idx'] = aidx
+            df['zenith_idx'] = zidx
+
+        return df
+
+    def plot_sunpositions(self):
+        fig, axes = plt.subplots(nrows=1, ncols=2, figsize=(10, 5))
+        ax1 = axes[0]
+        ax2 = axes[1]
+        self._ref_sunpos.plot(kind='scatter', x='azimuth', y='zenith', title='all possible sun positions', ax=ax1, s=1)
+        self.sunpos_grid.plot(kind='scatter', x='azimuth', y='zenith', title='resampled sun positions', ax=ax2, s=1)
+        ax1.yaxis.set_inverted(True)
+        ax2.yaxis.set_inverted(True)
+        plt.tight_layout()
+        plt.show()
+
+    def plot_corrections(self, azimuth: float, zenith: float):
+        sel = self.get_terrain_correction(azimuth=azimuth, zenith=zenith)
+        fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(8, 8))
+        im = ax.imshow(sel.values, extent=(self.bounds[0], self.bounds[2], self.bounds[1], self.bounds[3]), cmap='gray')
+        ax.set_xlabel('X Coordinate')
+        ax.set_ylabel('Y Coordinate')
+        ax.set_title(f"azimuth={sel['azimuth'].values}, zenith={sel['zenith'].values}")
+        plt.colorbar(im)
+        plt.show()
+
+    def _get_all_sunpos(self):
+        min_bound = sunpos_timeseries(self.latlonbounds[1], self.latlonbounds[0], '2024-01-01 00:00:00', '2024-12-31 23:59:00', freq='10min')
+        max_bound = sunpos_timeseries(self.latlonbounds[3], self.latlonbounds[2], '2024-01-01 00:00:00', '2024-12-31 23:59:00', freq='10min')
+        loc_sunpos = pd.concat([min_bound, max_bound]).reset_index(drop=True)
+
+        return loc_sunpos
+
+    def _make_sunpos_grid(self):
+        """
+
+        Args:
+
+        Returns:
+
+        """
+        min_z = self._ref_sunpos.loc[self._ref_sunpos['zenith'].idxmin(), 'zenith']
+        max_z = self._ref_sunpos.loc[self._ref_sunpos['zenith'].idxmax(), 'zenith']
+        min_a = self._ref_sunpos.loc[self._ref_sunpos['azimuth'].idxmin(), 'azimuth']
+        max_a = self._ref_sunpos.loc[self._ref_sunpos['azimuth'].idxmax(), 'azimuth']
+
+        z_rng = np.linspace(min_z, max_z, int((max_z - min_z) / self.zenith_resolution), True)
+        a_rng = np.linspace(min_a, max_a, int((max_a - min_a) / self.azimuth_resolution), True)
+        A, Z = np.meshgrid(a_rng, z_rng)
+
+        allsps = gpd.points_from_xy(self._ref_sunpos['azimuth'], self._ref_sunpos['zenith'])
+        spgrd_pnts = gpd.points_from_xy(A.ravel(), Z.ravel())
+        sppnt_gdf = gpd.GeoDataFrame(geometry=allsps)
+        resamp_sp = gpd.GeoDataFrame(geometry=spgrd_pnts)
+        concv_rng = np.linspace(sppnt_gdf.geometry.x.min(), sppnt_gdf.geometry.x.max(),
+                                int(sppnt_gdf.geometry.x.max() - sppnt_gdf.geometry.x.min()), True)
+        points = []
+        for v in np.arange(concv_rng.size - 1):
+            samp = sppnt_gdf.loc[(sppnt_gdf.geometry.x > concv_rng[v]) & (sppnt_gdf.geometry.x < concv_rng[v + 1])]
+            min_pnt = samp.loc[samp.geometry.y.idxmin()]
+            max_pnt = samp.loc[samp.geometry.y.idxmax()]
+            points.append(min_pnt.geometry)
+            points.append(max_pnt.geometry)
+
+        outer_poly_pnts = gpd.GeoDataFrame(geometry=points)
+        outer_poly_pnts['normalized_x'] = outer_poly_pnts.geometry.x - (outer_poly_pnts.geometry.x.mean())
+        outer_poly_pnts['normalized_y'] = outer_poly_pnts.geometry.y - (outer_poly_pnts.geometry.y.mean() - 15)
+        normx = outer_poly_pnts['normalized_x'].values
+        normy = outer_poly_pnts['normalized_y'].values
+        outer_poly_pnts['sort_angle'] = np.arctan2(normy, normx)
+        outer_poly_pnts = outer_poly_pnts.sort_values(by='sort_angle')
+        msk = Polygon([[p.x, p.y] for p in outer_poly_pnts.geometry.values])
+        clip_sps = resamp_sp.loc[resamp_sp.intersects(msk), :]
+
+        if self.verbose:
+            print(f'{len(clip_sps)} of {len(sppnt_gdf)} points retained')
+
+        fdf = pd.DataFrame({'azimuth': clip_sps.geometry.x, 'zenith': clip_sps.geometry.y})
+        self.resampled_azimuths = np.round(a_rng[np.isin(a_rng, fdf['azimuth'].unique())], 2)
+        self.resampled_zeniths = np.round(z_rng[np.isin(z_rng, fdf['zenith'].unique())], 2)
+
+        return fdf.round(2)
+
+    @staticmethod
+    def load_from_dataset(dset: str | Path | xr.Dataset):
+        if isinstance(dset, (str, Path)):
+            try:
+                dset = xr.open_dataset(dset)
+            except PermissionError:
+                dset = xr.open_zarr(dset)
+
+        tfrm = Affine(*dset.attrs['transform'])
+        bounds = tuple(dset.attrs['bounds'])
+        resolution = tuple(dset.attrs['resolution'])
+        crs = CRS.from_wkt(dset.attrs['crs'])
+        elev_fp = dset.attrs['elev_path']
+        az_res = dset.attrs['azimuth_res']
+        zn_res = dset.attrs['zenith_res']
+        if len(dset.attrs['elev_path']) == 0:
+            array = dset.isel(azimuth=0, zenith=0).correction_factor.values
+            dem_arr = Dem(array, tfrm, resolution, crs, bounds)
+        else:
+            dem_arr = Dem.load_raster(Path(dset.attrs['elev_path']))
+
+        spcor = SunPosCorrections(dem_arr, az_res, zn_res, corrections_dset=dset)
+
+        return spcor
+
+
+def sunpos_timeseries(lat: float,
+                      lon: float,
+                      start: str,
+                      end: str,
+                      freq: str = '1min',
+                      timezone: int = -7,
+                      return_julian: bool = False):
+    """
+
+    Args:
+        lat:
+        lon:
+        start:
+        end:
+        freq:
+        timezone:
+
+    Returns:
+
+    """
+    dates = pd.date_range(start, end, freq=freq)
+    jd = insol.julian_day(dates.year.values, dates.month.values, dates.day.values, dates.hour.values,
+                          dates.minute.values)
+    dayl = insol.daylength(44, -110, jd, -7)
+    sunrise = dayl[0, :]
+    sunset = dayl[1, :]
+    shour = dates.hour.values + (dates.minute.values / 60.0) + (dates.second.values / 3600.0)
+    day_hr_idx = np.where((sunrise < shour) & (sunset > shour))
+    sv = insol.sunvector(jd, 44, -110, -7)
+    sp = insol.sunpos(sv)
+    azi = sp[0]
+    zen = sp[1]
+    df = pd.DataFrame({'date': dates, 'zenith': zen, 'azimuth': azi})
+    if return_julian:
+        df['julian_day'] = jd
+    df = df.loc[day_hr_idx[0], :]
+    df = df.reset_index().drop(columns='index')
+
+    return df
 
 def inv_sun_angles(sp):
     inv_az = (sp[0] + 180) % 360
@@ -199,8 +564,9 @@ def doshade(dem, sv, res):
 
 # to be safe, make sure all inputs are float64
 @jit(nopython=True)
-def fast_doshade(dem, sp, res):
+def fast_doshade(dem: np.ndarray, sp: np.ndarray, res: float):
 
+    dem = dem.astype(np.float64)
     rads = np.radians(sp)
     nvx = np.sin(rads[0]) * np.sin(rads[1])
     nvy = -np.cos(rads[0]) * np.sin(rads[1])
@@ -855,3 +1221,5 @@ def dailyshade(dem_arr, res, lat, lon, timezone, start, end):
 #         shd_srs = None
 #
 #     return shd_srs
+
+
