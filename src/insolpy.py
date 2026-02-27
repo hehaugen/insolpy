@@ -17,6 +17,7 @@ from affine import Affine
 import xarray as xr
 from shapely.geometry import Point, Polygon
 
+# TODO: add documentation
 
 class Vector:
     def __init__(self, vector: np.ndarray):
@@ -169,6 +170,7 @@ class SunPosCorrections:
         if output is None:
             cf_array = np.empty((self.datarray.shape[0], self.datarray.shape[1], self.resampled_azimuths.size,
                                  self.resampled_zeniths.size))
+            # TODO: remove redundant sun positions
             for i, av in enumerate(self.resampled_azimuths):
                 for j, zv in enumerate(self.resampled_zeniths):
                     sv = insol.normalvector(zv, av)
@@ -235,6 +237,7 @@ class SunPosCorrections:
             )
             #template_ds = template_ds.chunk({'row': 1000, 'column': 1000})
             template_ds.to_zarr(self._zarr_path.as_posix(), mode='w', compute=False)
+            # TODO: remove redundant sun positions
             for i, av in enumerate(self.resampled_azimuths):
                 for j, zv in enumerate(self.resampled_zeniths):
                     sv = insol.normalvector(zv, av)
@@ -269,6 +272,7 @@ class SunPosCorrections:
         Args:
             azimuth:
             zenith:
+            return_ids:
 
         Returns:
 
@@ -289,8 +293,10 @@ class SunPosCorrections:
         fig, axes = plt.subplots(nrows=1, ncols=2, figsize=(10, 5))
         ax1 = axes[0]
         ax2 = axes[1]
-        self._ref_sunpos.plot(kind='scatter', x='azimuth', y='zenith', title='all possible sun positions', ax=ax1, s=1)
-        self.sunpos_grid.plot(kind='scatter', x='azimuth', y='zenith', title='resampled sun positions', ax=ax2, s=1)
+        self._ref_sunpos.plot(kind='scatter', x='azimuth', y='zenith',
+                              title=f'all possible sun positions (n={len(self._ref_sunpos)})', ax=ax1, s=1)
+        self.sunpos_grid.plot(kind='scatter', x='azimuth', y='zenith',
+                              title=f'resampled sun positions (n={len(self.sunpos_grid)})', ax=ax2, s=1)
         ax1.yaxis.set_inverted(True)
         ax2.yaxis.set_inverted(True)
         plt.tight_layout()
@@ -328,10 +334,10 @@ class SunPosCorrections:
 
         z_rng = np.linspace(min_z, max_z, int((max_z - min_z) / self.zenith_resolution), True)
         a_rng = np.linspace(min_a, max_a, int((max_a - min_a) / self.azimuth_resolution), True)
-        A, Z = np.meshgrid(a_rng, z_rng)
+        az, zn = np.meshgrid(a_rng, z_rng)
 
         allsps = gpd.points_from_xy(self._ref_sunpos['azimuth'], self._ref_sunpos['zenith'])
-        spgrd_pnts = gpd.points_from_xy(A.ravel(), Z.ravel())
+        spgrd_pnts = gpd.points_from_xy(az.ravel(), zn.ravel())
         sppnt_gdf = gpd.GeoDataFrame(geometry=allsps)
         resamp_sp = gpd.GeoDataFrame(geometry=spgrd_pnts)
         concv_rng = np.linspace(sppnt_gdf.geometry.x.min(), sppnt_gdf.geometry.x.max(),
@@ -405,6 +411,7 @@ def sunpos_timeseries(lat: float,
         end:
         freq:
         timezone:
+        return_julian:
 
     Returns:
 
@@ -412,12 +419,12 @@ def sunpos_timeseries(lat: float,
     dates = pd.date_range(start, end, freq=freq)
     jd = insol.julian_day(dates.year.values, dates.month.values, dates.day.values, dates.hour.values,
                           dates.minute.values)
-    dayl = insol.daylength(44, -110, jd, -7)
+    dayl = insol.daylength(lat, lon, jd, -7)
     sunrise = dayl[0, :]
     sunset = dayl[1, :]
     shour = dates.hour.values + (dates.minute.values / 60.0) + (dates.second.values / 3600.0)
     day_hr_idx = np.where((sunrise < shour) & (sunset > shour))
-    sv = insol.sunvector(jd, 44, -110, -7)
+    sv = insol.sunvector(jd, lat, lon, -7)
     sp = insol.sunpos(sv)
     azi = sp[0]
     zen = sp[1]
@@ -538,31 +545,7 @@ def doshade(dem, sv, res):
 
     return sombra
 
-# DEPRICATED - Use insolation package instead
-# def cgrad(dem, dlx, cArea=False):
-#     dly = dlx
-#     grad = np.gradient(dem)
-#     x_grad = grad[0] * 0.5 * dlx
-#     y_grad = grad[1] * 0.5 * dly
-#     z_grad = np.ones(dem.shape)
-#     z_grad = z_grad * dlx * dly
-#     cellArea = np.sqrt(x_grad ** 2 + y_grad ** 2 + z_grad ** 2)
-#     cellgr = np.stack([x_grad, y_grad, z_grad], axis=2)
-#     if cArea:
-#         return cellArea
-#     else:
-#         for i in np.arange(3):
-#             cellgr[:, :, i] = cellgr[:, :, i] / cellArea
-#
-#         return cellgr
 
-# Depricated - Uses insolation package instead
-# def hillshading(cgrad, sv):
-#     hsh = cgrad[:, :, 0] * sv[0] + cgrad[:, :, 1] * sv[1] + cgrad[:, :, 2] * sv[2]
-#     hsh = (hsh + np.abs(hsh)) / 2
-#     return hsh
-
-# to be safe, make sure all inputs are float64
 @jit(nopython=True)
 def fast_doshade(dem: np.ndarray, sp: np.ndarray, res: float):
 
@@ -651,6 +634,135 @@ def fast_doshade(dem: np.ndarray, sp: np.ndarray, res: float):
 
     return sombra
 
+
+@jit(nopython=True)
+def fast_shade_points(dem: np.ndarray,
+                      dem_res: float,
+                      irow: np.ndarray,
+                      jcol: np.ndarray,
+                      sunpos: np.ndarray):
+    """ Calculate shaded status (0 or 1) of points at given solar angle(s).
+
+    This function is designed to be called by fast_doshade_points, which handles
+    error checking and pre-processing before passing data to this optimized function.
+
+    Args:
+        dem: DEM as 2D numpy array of floats
+        dem_res: resolution in meters of the DEM
+        irow: x-coordinates of locations transformed to integer indices of corresponding DEM cell
+        jcol: y-coordinates of locations transformed to integer indices of corresponding DEM cell
+        sunpos: 2D Nx2 array where N=number of sun positions in form [zenith, azimuth]
+
+    Returns:
+            shdarray: 2D NxM array where N=number of sun positions and M=number of points
+    """
+    # dem = dem.astype(np.float64)  # to be safe
+
+    shd_locs = np.empty((len(sunpos), len(irow)))
+    ang = 0
+    for sp in sunpos:
+        zn = sp[0]
+        az = sp[1]
+        znr = np.radians(zn)
+        azr = np.radians(az)
+        nvx = np.sin(azr) * np.sin(znr)
+        nvy = -np.cos(azr) * np.sin(znr)
+        nvz = np.cos(znr)
+        sv = np.array([nvx, nvy, nvz])
+
+        for i in range(len(irow)):
+            xv = sv[0]
+            yv = sv[1]
+            zv = sv[2]
+            nrows = dem.shape[0]
+            ncols = dem.shape[1]
+            ray_ln = np.max(np.array(dem.shape))
+            d = np.sqrt(np.sqrt(1) / (xv ** 2 + yv ** 2))
+            dr = np.arange(0, ray_ln, d)
+            xr = (dr * xv).astype(np.int32)
+            yr = (dr * yv).astype(np.int32)
+            zr = dr * dem_res * zv
+
+            zorigin = dem[irow[i], jcol[i]]
+            xis = xr + irow[i]
+            yjs = yr + jcol[i]
+            zproj = zr + zorigin
+
+            lnmsk = np.where(((xis > 0) & (xis < nrows - 1)) & ((yjs > 0) & (yjs < ncols - 1)))[0]
+            xi_clp = xis[lnmsk]
+            yj_clp = yjs[lnmsk]
+
+            z_ext = []
+            for j in range(len(lnmsk)):
+                z_ext.append(dem[xi_clp[j], yj_clp[j]])
+            z_ext = np.array(z_ext)
+
+            zdiff = zproj[lnmsk] - z_ext
+
+            if (zdiff < 0).any():
+                shd = 0.0
+            else:
+                shd = 1.0
+
+            shd_locs[ang, i] = shd
+        ang = ang + 1
+
+    return shd_locs
+
+
+def fast_doshade_points(raster: str | Path | insolpy.Dem,
+                        geom: gpd.GeoDataFrame,
+                        sunpos: tuple | np.ndarray = (45.0, 315.0)):
+    """ Calculate shaded status (0 or 1) of points at given solar angle(s).
+
+    Can only make calculations off of sun angles, not datetimes. It is designed
+    to handle error checking and pre-processing before passing data to the
+    'jitted' fast_shade_points function.
+
+    Args:
+        raster: DEM
+        geom: list of points to determine shading at, in same crs as raster
+        sunpos: 2D Nx2 array where N=number of sun positions in form [zenith, azimuth]
+
+    Returns:
+        shdarray: 2D NxM array where N=number of sun positions and M=number of points
+    """
+
+    if isinstance(raster, (str, Path)):
+        r = insolpy.Dem.load_raster(raster)
+        datarray = r.data
+        data_res = r.resolution[0]
+        transform = r.transform
+        bounds = r.bounds
+    else:
+        datarray = raster.data
+        data_res = raster.resolution[0]
+        transform = raster.transform
+        bounds = raster.bounds
+
+    if ((geom.geometry.x < bounds.left).any()) or ((geom.geometry.x > bounds.right).any()) or (
+    (geom.geometry.y < bounds.bottom).any()) or ((geom.geometry.y > bounds.top).any()):
+        raise ValueError("An input point is not within the bounds of the raster dataset.")
+
+    if (geom.geom_type != 'Point').any():
+        raise AttributeError("One of the input geometries is not of geom_type POINT.")
+
+    gx = geom.geometry.x.values
+    gy = geom.geometry.y.values
+
+    if len(gx) != len(gy):
+        raise ValueError("The coordinate arrays do not match.")
+
+    gx, gy = rio.transform.rowcol(transform, gx, gy)
+
+    if isinstance(sunpos, tuple):
+        sunpos = np.array([sunpos])
+
+    shdarray = fast_shade_points(datarray, data_res, gx, gy, sunpos)
+
+    return shdarray
+
+
 def shade_at_points(dem: np.ndarray,
                     dem_res: float,
                     xcoords: np.ndarray,
@@ -695,10 +807,10 @@ def shade_at_points(dem: np.ndarray,
         xis = xr + irow[i]
         yjs = yr + jcol[i]
         zproj = zr + zorigin
-        lnmsk = np.where(((xis > 0) & (xis < ncols - 1)) & ((yjs > 0) & (yjs < nrows - 1)))
+        lnmsk = np.where(((xis > 0) & (xis < nrows - 1)) & ((yjs > 0) & (yjs < ncols - 1)))
         xi_clp = xis[lnmsk[0]]
         yj_clp = yjs[lnmsk[0]]
-        z_ext = dem[yj_clp, xi_clp]
+        z_ext = dem[xi_clp, yj_clp]
 
         zdiff = zproj[lnmsk[0]] - z_ext
 
@@ -770,7 +882,7 @@ def doshade_points(raster: str | Path | Dem,
     else:
         if isinstance(sunpos, tuple):
             sunpos = np.array([sunpos])
-            sunvecs = np.array(insol.normalvector(sunpos[:,0], sunpos[:,1]))
+            # sunvecs = np.array(insol.normalvector(sunpos[:,0], sunpos[:,1]))
 
         sunvecs = insol.normalvector(sunpos[:,0], sunpos[:,1]).T
         shd_arrs = []
@@ -782,106 +894,6 @@ def doshade_points(raster: str | Path | Dem,
 
     return shdarray
 
-# TODO - convert this function into doshade_polygon() maybe?, get raster cell centers within each polygon and run the
-#   shade at points function for all points in each polygon. Might be better to just use zonal stats.
-# def doshade_geometry(raster: str | Path | Dem,
-#                      geom: gpd.GeoDataFrame,
-#                      sun_vector: np.ndarray,
-#                      poly_output: str = 'scalar'):
-#     """
-#     Application of the insolpy.doshade() function for a point or polygon geometry calculated using 1D vectors from
-#     the geometry point(s) to see if terrain is shading those point(s).
-#     :param raster: a rioxarray.DataArray or rioxarray.Dataset of elevation in a projected CRS. Must include a transform
-#     attribute (DataArray.rio.transform()).
-#     :param geom: a geopandas.GeoDataFrame of a point or polygon area of interest to calculate shading. This should be a
-#     GeoDataFrame with only 1 row, if it has more the function will only compute shading for the first entry in the
-#     dataframe. Must have matching CRS as 'raster' input.
-#     :param sun_vector: numpy.array of a unit vector representing the sun direction (x,y,z). This is the output from
-#     the insolpy.sunvector() or insolpy.normalvector() functions.
-#     :param poly_output: str - 'scalar' for a scalar output which averages all cells in the target polygon, or
-#     'raster' for a rioxarray.DataArray of shading (the polygon is represented as a raster.
-#     :return: scalar or rioxarray.DataArray of shading factor (1=not shaded, 0=shaded)
-#     """
-#     # raster is a rioxarray DataArray or Dataset of elevation
-#     # assumes raster and geom are in the same crs
-#     # geom is a geopandas.GeoDataFrame
-#     g = geom.geometry.iloc[0]
-#     datarray = raster.sel(band=1).data
-#     data_res = raster.rio.resolution()[0]
-#     transform = raster.rio.transform()
-#
-#     xv = sun_vector[0]
-#     yv = sun_vector[1]
-#     zv = sun_vector[2]
-#     nrows, ncols = datarray.shape
-#     ray_ln = np.max(datarray.shape)
-#     d = np.sqrt(np.sqrt(1) / (xv ** 2 + yv ** 2))
-#     dr = np.arange(0, ray_ln, d)
-#     xr = (dr * xv).astype(int)
-#     yr = (dr * yv).astype(int)
-#     zr = dr * data_res * zv
-#
-#     if g.geom_type == 'Point':
-#         origin = rio.transform.rowcol(transform, g.x, g.y)
-#         zorigin = datarray[origin[0], origin[1]]
-#         xis = xr + origin[1]
-#         yjs = yr + origin[0]
-#         zproj = zr + zorigin
-#         lnmsk = np.where(((xis > 0) & (xis < ncols - 1)) & ((yjs > 0) & (yjs < nrows - 1)))
-#         xi_clp = xis[lnmsk[0]]
-#         yj_clp = yjs[lnmsk[0]]
-#         z_ext = datarray[yj_clp, xi_clp]
-#
-#         zdiff = zproj[lnmsk[0]] - z_ext
-#
-#         if (zdiff < 0).any():
-#             shd = 0.0
-#         else:
-#             shd = 1.0
-#
-#     elif g.geom_type == 'Polygon':
-#         clipped = raster.rio.clip(geom.geometry.values, geom.crs, drop=False)
-#         origins = np.where(~np.isnan(clipped.sel(band=1).data))
-#         zorigins = datarray[origins[0], origins[1]]
-#         xos = origins[1][None, :]
-#         yos = origins[0][None, :]
-#         xros = np.tile(xr, (origins[1].shape[0], 1)).T  # depends on sv
-#         xis = (xos + xros)
-#         yros = np.tile(yr, (origins[1].shape[0], 1)).T # depends on sv
-#         yjs = (yos + yros)
-#         xboo = ((xis > 0) & (xis < ncols - 1)).all(axis=1)
-#         xmsk_sz = xboo[xboo].shape[0]
-#         xboo = np.tile(xboo, (xis.shape[1], 1)).T
-#         yboo = ((yjs > 0) & (yjs < nrows - 1)).all(axis=1)
-#         ymsk_sz = yboo[yboo].shape[0]
-#         yboo = np.tile(yboo, (yjs.shape[1], 1)).T
-#         lnmsk = np.logical_and(xboo, yboo)
-#         msk_rows = np.min([xmsk_sz, ymsk_sz])
-#         msk_cols = lnmsk.shape[1]
-#         xi_clp = xis[lnmsk]
-#         yj_clp = yjs[lnmsk]
-#         z_ext = datarray[yj_clp, xi_clp]
-#         z_ext = z_ext.reshape((msk_rows, msk_cols))
-#         zproj = zorigins[None, :] + np.tile(zr, (zorigins.shape[0], 1)).T
-#         zdiff = zproj[lnmsk].reshape((msk_rows, msk_cols)) - z_ext
-#         shdf = np.where((zdiff < 0).any(axis=0), 0.0, 1.0)
-#
-#         if poly_output == 'scalar':
-#             shd = np.nanmean(shdf)
-#         elif poly_output == 'raster':
-#             shd = clipped.sel(band=1).rename('shade_factor')
-#             shd.data[origins[0], origins[1]] = shdf
-#             shd.attrs = {'units': '1=not shaded, 0=shaded'}
-#             shd = shd[np.min(origins[0]):np.max(origins[0] + 1), np.min(origins[1]):np.max(origins[1] + 1)]
-#         else:
-#             print("poly_output argument is not recognized, choose 'scalar' or 'raster'")
-#             shd = None
-#
-#     else:
-#         print("Geometry type given is not compatible.")
-#         shd = None
-#
-#     return shd
 
 def hillshade_points(raster: str | Path | Dem,
                      geom: gpd.GeoDataFrame,
@@ -967,7 +979,6 @@ def hillshade_points(raster: str | Path | Dem,
     else:
         if isinstance(sunpos, tuple):
             sunpos = np.array([sunpos])
-            sunvecs = np.array(insol.normalvector(sunpos[:,0], sunpos[:,1]))
 
         sunvecs = insol.normalvector(sunpos[:,0], sunpos[:,1]).T
         hs_arr = []
@@ -984,60 +995,7 @@ def hillshade_points(raster: str | Path | Dem,
 
     return hsarray
 
-# TODO: depricate this? Or alter to work on polygons but may be more efficient to just do raster and zonal stats for
-#   larger polygons
-# def hillshade_geometry(raster, geom, sun_vector, poly_output='scalar'):
-#     """
-#     Application of the insolpy.hillshading() function for a point or polygon geometry to define the angle adjustment
-#     for solar radiation based on terrain slope and sun angle.
-#     :param raster: a rioxarray.DataArray or rioxarray.Dataset of elevation in a projected CRS. Must include a transform
-#     attribute (DataArray.rio.transform()).
-#     :param geom: a geopandas.GeoDataFrame of a point or polygon area of interest to calculate shading. This should be a
-#     GeoDataFrame with only 1 row, if it has more the function will only compute shading for the first entry in the
-#     dataframe. Must have matching CRS as 'raster' input.
-#     :param sun_vector: numpy.array of a unit vector representing the sun direction (x,y,z). This is the output from
-#     the insolpy.sunvector() or insolpy.normalvector() functions.
-#     :param poly_output: str - 'scalar' for a scalar output which averages all cells in the target polygon, or
-#     'raster' for a rioxarray.DataArray of shading (the polygon is represented as a raster).
-#     :return:
-#     """
-#     datarray = raster.sel(band=1).data
-#     g = geom.geometry.iloc[0]
-#     data_res = raster.rio.resolution()[0]
-#     transform = raster.rio.transform()
-#
-#     if g.geom_type == 'Point':
-#         origin = rio.transform.rowcol(transform, g.x, g.y)
-#         garr = datarray[origin[0] - 1:origin[0] + 2, origin[1] - 1:origin[1] + 2]
-#         cgarr = insol.cgrad(garr, data_res)
-#         hs = insol.hillshading(cgarr, sun_vector)
-#         hillshd = hs[1, 1]
-#
-#     elif g.geom_type == 'Polygon':
-#         clipped = raster.rio.clip(geom.geometry.values, geom.crs)
-#         clipped = clipped.sel(band=1)
-#         garr = insol.cgrad(clipped.data, data_res)
-#         HS = insol.hillshading(garr, sun_vector)
-#
-#         if poly_output == 'scalar':
-#             hillshd = np.nanmean(HS)
-#         elif poly_output == 'raster':
-#             hillshd = clipped.rename('hillshade_factor')
-#             hillshd.data = HS
-#             hillshd.attrs = {'units': 'None'}
-#         else:
-#             print("poly_output argument is not recognized, choose 'scalar' or 'raster'")
-#             hillshd = None
-#
-#     else:
-#         print("Geometry type given is not compatible.")
-#         hillshd = None
-#
-#
-#     return hillshd
 
-# TODO: need to adjust so that daily correction factors are based on the ratio of theoretical max radiation and the
-#   terrain adjusted theoretical value
 def dailyshade(dem_arr, res, lat, lon, timezone, start, end):
     """
     Computes average daily shading factor for every cell of a digital elevation model (DEM) for a range of dates.
@@ -1074,9 +1032,9 @@ def dailyshade(dem_arr, res, lat, lon, timezone, start, end):
 
             hsh = insol.hillshading(dem_arr, res, sv)
             shd = fast_doshade(dem_arr, insol.sunpos(sv), res=res)
-            HS = hsh * shd
+            hs_fin = hsh * shd
 
-            day_arrays.append(HS)
+            day_arrays.append(hs_fin)
 
         day_array = np.dstack(day_arrays)
 
@@ -1084,142 +1042,3 @@ def dailyshade(dem_arr, res, lat, lon, timezone, start, end):
         shd_arrays.append(day_array)
 
     return shd_arrays, dates
-
-# TODO: Check, this may be depricated now that dates can be passed to doshade_points (polygon version will be the same)
-# def dailyshade_geometry(raster, geom, timezone, start, end):
-#     """
-#     Computes average daily shading factor for an input geometry.
-#     :param raster: a rioxarray.DataArray or rioxarray.Dataset of elevation (1 band) in a projected CRS.
-#     Must include a transform attribute (DataArray.rio.transform()).
-#     :param geom: a geopandas.GeoDataFrame of a point or polygon area of interest to calculate shading. This should be a
-#     GeoDataFrame with only 1 row, if it has more the function will only compute shading for the first entry in the
-#     dataframe. Must have matching CRS as 'raster' input.
-#     :param timezone: int - UTC offset of the DEM location
-#     :param start: str - date string formatted as "YYYY-MM-DD"
-#     :param end: str - date string formatted as "YYYY-MM-DD"
-#     :return: pandas.Series - of daily shading factors for the input geometry
-#     """
-#
-#     start_d = datetime.strptime("{0}".format(start), "%Y-%m-%d")
-#     end_d = datetime.strptime("{0}".format(end), "%Y-%m-%d")
-#     tdiff = (end_d - start_d).days
-#     dates = [start_d + timedelta(days=x) for x in range(tdiff + 1)]
-#     tmzn = timezone
-#     g = geom.geometry.iloc[0]
-#     res = raster.rio.resolution()[0]
-#
-#     if g.geom_type == 'Point':
-#         wgs_geom = geom.to_crs(4326)
-#         lat = wgs_geom.geometry.y.iloc[0]
-#         lon = wgs_geom.geometry.x.iloc[0]
-#
-#         shd_vals = []
-#         for day in dates:
-#             dlday = day + timedelta(hours=12)
-#             midjd = JD(dlday)
-#             day_len = daylength(lat, lon, midjd, tmzn)
-#             hour_vals = []
-#             for h in np.linspace(day_len[0], day_len[1], int(day_len[2]), endpoint=True):
-#                 hhours = int(h)
-#                 hminutes = h * 60 % 60
-#
-#                 dayhr = JD(day + timedelta(hours=hhours, minutes=hminutes))
-#                 sv = sunvector(dayhr, lat, lon, tmzn)
-#
-#                 hsh = hillshade_geometry(raster, geom, sv, poly_output='scalar')
-#                 shd = doshade_geometry(raster, geom, sv, poly_output='scalar')
-#                 HS = hsh * shd
-#
-#                 hour_vals.append(HS)
-#
-#             day_array = np.array(hour_vals)
-#
-#             day_shd = day_array.mean()
-#             shd_vals.append(day_shd)
-#
-#         shd_srs = pd.Series(shd_vals, index=pd.DatetimeIndex(dates))
-#         shd_srs.name = 'shd_factor'
-#
-#     elif g.geom_type == 'Polygon':
-#         datarray = raster.sel(band=1).data
-#         data_res = raster.rio.resolution()[0]
-#
-#         cent = geom.centroid
-#         cent_wgs = cent.to_crs(4326)
-#         lat = cent_wgs.geometry.y.iloc[0]
-#         lon = cent_wgs.geometry.x.iloc[0]
-#
-#         clipped = raster.rio.clip(geom.geometry.values, geom.crs, drop=False)
-#         origins = np.where(~np.isnan(clipped.sel(band=1).data))
-#         zorigins = datarray[origins[0], origins[1]]
-#         xos = origins[1][None, :]
-#         yos = origins[0][None, :]
-#
-#         shd_vals = []
-#         for day in dates:
-#             dlday = day + timedelta(hours=12)
-#             midjd = JD(dlday)
-#             day_len = daylength(lat, lon, midjd, tmzn)
-#             hour_vals = []
-#             for h in np.linspace(day_len[0], day_len[1], int(day_len[2]), endpoint=True):
-#                 hhours = int(h)
-#                 hminutes = h * 60 % 60
-#
-#                 dayhr = JD(day + timedelta(hours=hhours, minutes=hminutes))
-#                 sv = sunvector(dayhr, lat, lon, tmzn)
-#
-#                 xv = sv[0]
-#                 yv = sv[1]
-#                 zv = sv[2]
-#                 nrows, ncols = datarray.shape
-#                 ray_ln = np.max(datarray.shape)
-#                 d = np.sqrt(np.sqrt(1) / (xv ** 2 + yv ** 2))
-#                 dr = np.arange(0, ray_ln, d)
-#                 xr = (dr * xv).astype(int)
-#                 yr = (dr * yv).astype(int)
-#                 zr = dr * data_res * zv
-#
-#                 xros = np.tile(xr, (origins[1].shape[0], 1)).T  # depends on sv
-#                 xis = (xos + xros)
-#                 yros = np.tile(yr, (origins[1].shape[0], 1)).T  # depends on sv
-#                 yjs = (yos + yros)
-#                 xboo = ((xis > 0) & (xis < ncols - 1)).all(axis=1)
-#                 xmsk_sz = xboo[xboo].shape[0]
-#                 xboo = np.tile(xboo, (xis.shape[1], 1)).T
-#                 yboo = ((yjs > 0) & (yjs < nrows - 1)).all(axis=1)
-#                 ymsk_sz = yboo[yboo].shape[0]
-#                 yboo = np.tile(yboo, (yjs.shape[1], 1)).T
-#                 lnmsk = np.logical_and(xboo, yboo)
-#                 msk_rows = np.min([xmsk_sz, ymsk_sz])
-#                 msk_cols = lnmsk.shape[1]
-#                 xi_clp = xis[lnmsk]
-#                 yj_clp = yjs[lnmsk]
-#                 z_ext = datarray[yj_clp, xi_clp]
-#                 z_ext = z_ext.reshape((msk_rows, msk_cols))
-#                 zproj = zorigins[None, :] + np.tile(zr, (zorigins.shape[0], 1)).T
-#                 zdiff = zproj[lnmsk].reshape((msk_rows, msk_cols)) - z_ext
-#                 shdf = np.where((zdiff < 0).any(axis=0), 0.0, 1.0)
-#                 shd = np.nanmean(shdf)
-#
-#                 hsh = hillshade_geometry(raster, geom, sv, poly_output='scalar')
-#                 HS = hsh * shd
-#
-#                 hour_vals.append(HS)
-#
-#             day_array = np.array(hour_vals)
-#
-#             day_shd = day_array.mean()
-#             shd_vals.append(day_shd)
-#
-#         shd_srs = pd.Series(shd_vals, index=pd.DatetimeIndex(dates))
-#         shd_srs.name = 'shd_factor'
-#
-#     else:
-#         print("Geometry type input not supported.")
-#         lat = None
-#         lon = None
-#         shd_srs = None
-#
-#     return shd_srs
-
-
