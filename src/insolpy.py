@@ -710,7 +710,7 @@ def fast_shade_points(dem: np.ndarray,
     return shd_locs
 
 
-def fast_doshade_points(raster: str | Path | insolpy.Dem,
+def fast_doshade_points(raster: str | Path | Dem,
                         geom: gpd.GeoDataFrame,
                         sunpos: tuple | np.ndarray = (45.0, 315.0)):
     """ Calculate shaded status (0 or 1) of points at given solar angle(s).
@@ -729,7 +729,7 @@ def fast_doshade_points(raster: str | Path | insolpy.Dem,
     """
 
     if isinstance(raster, (str, Path)):
-        r = insolpy.Dem.load_raster(raster)
+        r = Dem.load_raster(raster)
         datarray = r.data
         data_res = r.resolution[0]
         transform = r.transform
