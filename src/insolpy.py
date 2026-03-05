@@ -635,6 +635,7 @@ def fast_doshade(dem: np.ndarray, sp: np.ndarray, res: float):
     return sombra
 
 
+# TODO: Fix this function. It appears to give the wrong values relative to raster calculations.
 @jit(nopython=True)
 def fast_shade_points(dem: np.ndarray,
                       dem_res: float,
@@ -657,6 +658,9 @@ def fast_shade_points(dem: np.ndarray,
             shdarray: 2D NxM array where N=number of sun positions and M=number of points
     """
     # dem = dem.astype(np.float64)  # to be safe
+    nrows = dem.shape[0]
+    ncols = dem.shape[1]
+    ray_ln = np.max(np.array(dem.shape))
 
     shd_locs = np.empty((len(sunpos), len(irow)))
     ang = 0
@@ -670,19 +674,17 @@ def fast_shade_points(dem: np.ndarray,
         nvz = np.cos(znr)
         sv = np.array([nvx, nvy, nvz])
 
-        for i in range(len(irow)):
-            xv = sv[0]
-            yv = sv[1]
-            zv = sv[2]
-            nrows = dem.shape[0]
-            ncols = dem.shape[1]
-            ray_ln = np.max(np.array(dem.shape))
-            d = np.sqrt(np.sqrt(1) / (xv ** 2 + yv ** 2))
-            dr = np.arange(0, ray_ln, d)
-            xr = (dr * xv).astype(np.int32)
-            yr = (dr * yv).astype(np.int32)
-            zr = dr * dem_res * zv
+        xv = sv[0]
+        yv = sv[1]
+        zv = sv[2]
 
+        d = np.sqrt(np.sqrt(1) / (xv ** 2 + yv ** 2))
+        dr = np.arange(0, ray_ln, d)
+        xr = (dr * xv).astype(np.int32)
+        yr = (dr * yv).astype(np.int32)
+        zr = dr * dem_res * zv
+
+        for i in range(len(irow)):
             zorigin = dem[irow[i], jcol[i]]
             xis = xr + irow[i]
             yjs = yr + jcol[i]
